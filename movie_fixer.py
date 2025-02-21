@@ -49,7 +49,7 @@ class MovieFixer:
 
     def generate_patch(self, original_file, patched_file):
         """Generate a reverse binary patch file with timestamp in filename."""
-        timestamp = int(time.time())  # Get current Unix timestamp
+        timestamp = int(time.time())
         patch_ext = '.patch' if self.patch_tool in ['bsdiff', 'xdelta3'] else '.diff'
         patch_file = f"{original_file}.{timestamp}{patch_ext}"
         original_stat = os.stat(original_file)
@@ -75,7 +75,6 @@ class MovieFixer:
             if not os.path.exists(patch_file) or os.path.getsize(patch_file) == 0:
                 raise Exception("Generated patch file is missing or empty")
 
-            # Copy only owner and permissions to patch file
             self.copy_file_attributes(patch_file, original_stat)
             
             logger.info(f"Generated patch: {patch_file}")
@@ -90,23 +89,6 @@ class MovieFixer:
             logger.error(f"Unexpected error generating patch for {original_file}: {e}")
             return None
 
-    def get_hardlinks(self, file_path):
-        """Get all hardlinks for a given file."""
-        try:
-            inode = os.stat(file_path).st_ino
-            hardlinks = []
-            for root, _, files in os.walk(self.directory):
-                for file in files:
-                    path = os.path.join(root, file)
-                    if os.stat(path).st_ino == inode and path != str(file_path):
-                        hardlinks.append(path)
-                if not self.recursive:
-                    break
-            return hardlinks
-        except Exception as e:
-            logger.error(f"Failed to get hardlinks for {file_path}: {e}")
-            return []
-
     def process_file(self, file_path):
         """Process a single movie file."""
         file_path = Path(file_path).resolve()
@@ -119,7 +101,6 @@ class MovieFixer:
         if file_path.suffix.lower() not in self.movie_extensions:
             return
 
-        # Check GID
         try:
             file_stat = os.stat(file_path)
             if self.target_gid is not None and file_stat.st_gid != self.target_gid:
@@ -131,11 +112,8 @@ class MovieFixer:
 
         logger.info(f"Processing: {file_path}")
         patched_file = file_path.with_suffix('.patched' + file_path.suffix)
-
-        # Store original file stats before modification
         original_stat = os.stat(file_path)
 
-        # Run ffmpeg command with real-time output and progress
         cmd = [
             'ffmpeg', '-i', str(file_path),
             '-c', 'copy', '-map_metadata', '0',
@@ -173,27 +151,18 @@ class MovieFixer:
                 process.kill()
                 raise Exception(f"FFmpeg timed out after 300 seconds for {file_path}")
 
-            # Generate reverse patch *before* modifying the original file
             patch_file = self.generate_patch(file_path, patched_file)
             if not patch_file:
                 raise Exception("Patch generation failed")
 
-            # Get hardlinks
-            hardlinks = self.get_hardlinks(file_path)
-
-            # Remove original and move patched file
             os.unlink(file_path)
             os.rename(patched_file, file_path)
-
-            # Restore only ownership and permissions to the final file
             self.copy_file_attributes(file_path, original_stat)
 
-            # Store information
             file_info = {
                 'original_file': str(file_path),
                 'patch_file': patch_file,
                 'patch_tool': self.patch_tool,
-                'hardlinks': hardlinks,
                 'timestamp': time.time()
             }
 
@@ -215,15 +184,11 @@ class MovieFixer:
     def copy_file_attributes(self, dst_path, original_stat):
         """Copy only ownership and read/write permissions from original_stat to dst_path."""
         try:
-            # Set ownership (uid, gid) from original_stat
             os.chown(dst_path, original_stat.st_uid, original_stat.st_gid)
-
-            # Extract only read/write permissions (rw-rw-rw-)
             perms = original_stat.st_mode & (stat.S_IRUSR | stat.S_IWUSR | 
                                           stat.S_IRGRP | stat.S_IWGRP | 
                                           stat.S_IROTH | stat.S_IWOTH)
             os.chmod(dst_path, perms)
-
             logger.debug(f"Copied attributes to {dst_path}: UID={original_stat.st_uid}, GID={original_stat.st_gid}, Mode={oct(perms)}")
         except PermissionError as e:
             logger.error(f"Permission denied when setting attributes on {dst_path}: {e}")
