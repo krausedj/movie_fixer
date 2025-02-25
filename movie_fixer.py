@@ -50,7 +50,7 @@ class MovieFixer:
     def has_patch_files(self, file_path):
         """Check if patch files exist for the given movie file.
 
-        Looks for files matching the pattern `<file_path.name>.*.v2.diff` in the same directory.
+        Looks for files starting with the movie filename and ending with '.v2.diff' in the same directory.
 
         Args:
             file_path (Path): Path to the movie file.
@@ -58,9 +58,14 @@ class MovieFixer:
         Returns:
             bool: True if any patch files exist, False otherwise.
         """
-        # Glob pattern to find existing patch files
-        patch_glob = f"{file_path.name}.*.v2.diff"
-        return any(file_path.parent.glob(patch_glob))
+        file_base = file_path.name  # e.g., "movie.mp4"
+        dir_path = file_path.parent  # e.g., "/path/to"
+        for filename in os.listdir(dir_path):
+            if filename.startswith(file_base) and filename.endswith('.v2.diff'):
+                logger.debug(f"Found patch file: {filename} for {file_path}")
+                return True
+        logger.debug(f"No patch files found for {file_path}")
+        return False
 
     def generate_patch(self, original_file, patched_file):
         """Generate a binary diff patch from the original to the patched file.
@@ -87,11 +92,6 @@ class MovieFixer:
             # diff returns: 0 (identical), 1 (different), >1 (error)
             if result.returncode > 1:
                 raise subprocess.CalledProcessError(result.returncode, cmd)
-            # Check if the patch file is empty (files are identical)
-            if self.force and os.path.getsize(patch_file) == 0:
-                logger.warning(f"Forced to make a patch and no differences between {original_file} and {patched_file}; removing empty patch")
-                os.unlink(patch_file)
-                return None
             # Preserve original file attributes on the patch file
             original_stat = os.stat(original_file)
             self.copy_file_attributes(patch_file, original_stat)
@@ -151,6 +151,7 @@ class MovieFixer:
             '-nostdin',
             str(patched_file)
         ]
+        patch_file = None  # Initialize to avoid undefined variable in cleanup
         try:
             # Execute FFmpeg and stream output
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -185,7 +186,7 @@ class MovieFixer:
             # Cleanup temporary files on failure
             if patched_file.exists():
                 os.unlink(patched_file)
-            if 'patch_file' in locals() and os.path.exists(patch_file):
+            if patch_file and os.path.exists(patch_file):
                 os.unlink(patch_file)
 
     def copy_file_attributes(self, dst_path, original_stat):
