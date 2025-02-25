@@ -4,308 +4,234 @@ import argparse
 import os
 import time
 import subprocess
-import json
 from pathlib import Path
 import logging
 import shutil
 import stat
 
-# Setup logging with timestamp, level, and message format
+# Configure logging with timestamp, level, and message
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class MovieFixer:
-    """A class to process movie files, generate patches, and maintain file attributes."""
-    
-    def __init__(self, directory, recursive, data_file, target_gid):
-        """Initialize the MovieFixer with directory and processing options.
+    """A utility class to process movie files, generate binary diff patches, and preserve file attributes.
+
+    This script uses FFmpeg to fix movie files for fast seeking and generates a patch file using `diff`
+    to record differences between the original and patched files. The patch file can be used to:
+    - Transform the original file to the patched file: `patch <original_file> <patch_file>`
+    - Revert the patched file back to the original: `patch -R <file_path> <patch_file>` (after processing,
+      <file_path> contains the patched file).
+
+    Patch files are named `<file_path>.<timestamp>.v2.diff` and stored in the same directory as the movie file.
+    """
+
+    def __init__(self, directory, recursive, force, target_gid):
+        """Initialize the MovieFixer with processing options.
 
         Args:
-            directory (str): The directory to search for movie files.
-            recursive (bool): Whether to search subdirectories recursively.
-            data_file (str): Path to the JSON file storing processed file data.
+            directory (str): Directory to search for movie files.
+            recursive (bool): If True, search subdirectories recursively.
+            force (bool): If True, process files even if patch files exist.
             target_gid (int or None): Group ID to filter files; None means no filtering.
-        """
-        # Resolve the directory path to an absolute path
-        self.directory = Path(directory).resolve()
-        self.recursive = recursive
-        self.data_file = Path(data_file)
-        self.target_gid = target_gid
-        # Load previously processed files or start with an empty dict
-        self.processed_files = self.load_processed_files()
-        # Define supported movie file extensions
-        self.movie_extensions = {'.mp4', '.mkv', '.avi', '.mov'}
-        # Detect which patch tool is available
-        self.patch_tool = self.detect_patch_tool()
-
-    def detect_patch_tool(self):
-        """Detect which binary patch tool is available on the system.
-
-        Returns:
-            str: Name of the detected patch tool ('bsdiff', 'xdelta3', or 'diff').
 
         Raises:
-            Exception: If no suitable patch tool is found.
+            Exception: If the `diff` tool is not available on the system.
         """
-        # Check for available patch tools in order of preference
-        for tool in ['bsdiff', 'xdelta3', 'diff']:
-            if shutil.which(tool):
-                logger.info(f"Using {tool} for patch generation")
-                return tool
-        raise Exception("No suitable patch tool found (bsdiff, xdelta3, or diff required)")
+        self.directory = Path(directory).resolve()
+        self.recursive = recursive
+        self.force = force
+        self.target_gid = target_gid
+        # Supported movie file extensions
+        self.movie_extensions = {'.mp4', '.mkv', '.avi', '.mov'}
+        # Verify that diff is available
+        if not shutil.which('diff'):
+            raise Exception("The 'diff' tool is required but not found in PATH")
 
-    def load_processed_files(self):
-        """Load the dictionary of previously processed files from the data file.
+    def has_patch_files(self, file_path):
+        """Check if patch files exist for the given movie file.
 
-        Returns:
-            dict: Dictionary of processed files, empty if file doesn't exist or is corrupted.
-        """
-        # Check if the data file exists
-        if self.data_file.exists():
-            try:
-                # Attempt to load the JSON data
-                with open(self.data_file, 'r') as f:
-                    return json.load(f)
-            except json.JSONDecodeError:
-                logger.error(f"Corrupted data file {self.data_file}, starting fresh")
-        # Return empty dict if file doesn't exist or is invalid
-        return {}
-
-    def save_processed_files(self):
-        """Save the processed files dictionary to the persistent data file."""
-        # Write the processed files dict to the JSON file with indentation
-        with open(self.data_file, 'w') as f:
-            json.dump(self.processed_files, f, indent=2)
-
-    def generate_patch(self, original_file, patched_file):
-        """Generate a reverse binary patch file with a timestamped filename.
+        Looks for files matching the pattern `<file_path.name>.*.v2.diff` in the same directory.
 
         Args:
-            original_file (str or Path): Path to the original movie file.
-            patched_file (str or Path): Path to the FFmpeg-processed movie file.
+            file_path (Path): Path to the movie file.
 
         Returns:
-            str or None: Path to the generated patch file, or None if generation fails.
+            bool: True if any patch files exist, False otherwise.
         """
-        # Generate a unique timestamp for the patch filename
+        # Glob pattern to find existing patch files
+        patch_glob = f"{file_path.name}.*.v2.diff"
+        return any(file_path.parent.glob(patch_glob))
+
+    def generate_patch(self, original_file, patched_file):
+        """Generate a binary diff patch from the original to the patched file.
+
+        Creates a patch file named `<original_file>.<timestamp>.v2.diff`. This patch transforms
+        the original file into the patched file when applied with `patch`. To revert from the
+        patched file (post-processing) to the original, use `patch -R`.
+
+        Args:
+            original_file (Path): Path to the original movie file.
+            patched_file (Path): Path to the FFmpeg-processed movie file.
+
+        Returns:
+            str or None: Path to the generated patch file, or None if generation fails or files are identical.
+        """
         timestamp = int(time.time())
-        patch_ext = '.patch' if self.patch_tool in ['bsdiff', 'xdelta3'] else '.diff'
-        patch_file = f"{original_file}.{timestamp}{patch_ext}"
-        # Get original file stats for attribute copying
-        original_stat = os.stat(original_file)
-        
+        patch_file = f"{original_file}.{timestamp}.v2.diff"
+        # Command to generate a binary diff patch
+        cmd = ['diff', '--binary', str(original_file), str(patched_file)]
         try:
-            # Select and execute the appropriate patch tool
-            if self.patch_tool == 'bsdiff':
-                cmd = ['bsdiff', str(original_file), str(patched_file), patch_file]
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            elif self.patch_tool == 'xdelta3':
-                cmd = ['xdelta3', '-e', '-s', str(original_file), str(patched_file), patch_file]
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            else:  # diff
-                cmd = ['diff', '--binary', str(original_file), str(patched_file)]
-                logger.debug(f"Running diff command: {' '.join(cmd)}")
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                # diff returns 1 for differences, >1 for errors
-                if result.returncode > 1:
-                    raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-                if not result.stdout:
-                    raise Exception("diff produced no output")
-                # Write diff output to file
-                with open(patch_file, 'w') as f:
-                    f.write(result.stdout)
-
-            # Verify patch file was created and has content
-            if not os.path.exists(patch_file) or os.path.getsize(patch_file) == 0:
-                raise Exception("Generated patch file is missing or empty")
-
-            # Apply original file's ownership and permissions to patch
+            # Redirect diff output to the patch file
+            with open(patch_file, 'w') as f:
+                result = subprocess.run(cmd, stdout=f, text=True)
+            # diff returns: 0 (identical), 1 (different), >1 (error)
+            if result.returncode > 1:
+                raise subprocess.CalledProcessError(result.returncode, cmd)
+            # Check if the patch file is empty (files are identical)
+            if self.force and os.path.getsize(patch_file) == 0:
+                logger.warning(f"Forced to make a patch and no differences between {original_file} and {patched_file}; removing empty patch")
+                os.unlink(patch_file)
+                return None
+            # Preserve original file attributes on the patch file
+            original_stat = os.stat(original_file)
             self.copy_file_attributes(patch_file, original_stat)
-            
-            logger.info(f"Generated patch: {patch_file}")
+            logger.info(f"Generated patch file: {patch_file}")
             return patch_file
         except subprocess.CalledProcessError as e:
-            logger.error(f"Patch generation failed for {original_file} with command {' '.join(cmd)}")
-            logger.error(f"Exit code: {e.returncode}")
-            logger.error(f"Stdout: {e.stdout}")
-            logger.error(f"Stderr: {e.stderr}")
+            logger.error(f"diff failed for {original_file} with exit code {e.returncode}")
+            if os.path.exists(patch_file):
+                os.unlink(patch_file)
             return None
         except Exception as e:
-            logger.error(f"Unexpected error generating patch for {original_file}: {e}")
+            logger.error(f"Patch generation failed for {original_file}: {e}")
+            if os.path.exists(patch_file):
+                os.unlink(patch_file)
             return None
 
     def process_file(self, file_path):
-        """Process a single movie file with FFmpeg and generate a patch.
+        """Process a movie file with FFmpeg and generate a patch for changes.
+
+        Skips processing if patch files exist and force mode is off, or if the file doesn’t match
+        the target group ID (if specified). Replaces the original file with the patched version
+        and generates a patch file.
 
         Args:
             file_path (str or Path): Path to the movie file to process.
         """
-        # Resolve the file path to an absolute path
         file_path = Path(file_path).resolve()
-        file_key = str(file_path)
-
-        # Skip if file was already processed
-        if file_key in self.processed_files:
+        # Skip if already processed and not in force mode
+        if not self.force and self.has_patch_files(file_path):
             logger.info(f"Skipping already processed file: {file_path}")
             return
-
-        # Check if file has a supported movie extension
+        # Validate file extension
         if file_path.suffix.lower() not in self.movie_extensions:
             return
-
-        # Verify GID if specified
+        # Check group ID if specified
         try:
             file_stat = os.stat(file_path)
             if self.target_gid is not None and file_stat.st_gid != self.target_gid:
                 logger.info(f"Skipping {file_path}: GID {file_stat.st_gid} does not match target {self.target_gid}")
                 return
         except Exception as e:
-            logger.error(f"Failed to check GID for {file_path}: {e}")
+            logger.error(f"Failed to stat {file_path} for GID check: {e}")
             return
 
-        logger.info(f"Processing: {file_path}")
-        # Create temporary output filename
+        logger.info(f"Starting processing of: {file_path}")
         patched_file = file_path.with_suffix('.patched' + file_path.suffix)
-        # Store original file stats
         original_stat = os.stat(file_path)
-
-        # FFmpeg command to optimize file for fast seeking
+        # FFmpeg command to fix the movie file
         cmd = [
             'ffmpeg', '-i', str(file_path),
             '-c', 'copy', '-map_metadata', '0',
             '-movflags', '+faststart',
+            '-fflags', '+genpts+igndts',
             '-v', 'info',
             '-progress', 'pipe:1',
-            '-y',          # Overwrite output without prompting
-            '-nostdin',    # Disable interactive input
+            '-y',  # Overwrite output file if it exists
+            '-nostdin',
             str(patched_file)
         ]
-
         try:
-            logger.debug(f"Running FFmpeg command: {' '.join(cmd)}")
-            # Launch FFmpeg process with real-time output
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
-
-            # Stream FFmpeg output to console
+            # Execute FFmpeg and stream output
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, bufsize=1, universal_newlines=True)
             while True:
                 line = process.stdout.readline()
                 if not line and process.poll() is not None:
                     break
                 if line:
                     print(line.strip())
+            return_code = process.wait(timeout=900)  # 15-minute timeout
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, cmd, output="Check console output")
 
-            # Wait for FFmpeg to complete with a timeout
-            try:
-                return_code = process.wait(timeout=300)
-                if return_code != 0:
-                    raise subprocess.CalledProcessError(return_code, cmd, output="See console output above")
-            except subprocess.TimeoutExpired:
-                process.kill()
-                raise Exception(f"FFmpeg timed out after 300 seconds for {file_path}")
-
-            # Generate patch file before modifying original
+            # Generate patch before replacing the original file
             patch_file = self.generate_patch(file_path, patched_file)
-            if not patch_file:
-                raise Exception("Patch generation failed")
+            if patch_file is None:
+                raise Exception("Patch generation failed or files are identical")
 
-            # Replace original file with processed version
+            # Replace original file with patched version
             os.unlink(file_path)
             os.rename(patched_file, file_path)
-            # Restore original ownership and permissions
+            # Restore original file attributes
             self.copy_file_attributes(file_path, original_stat)
-
-            # Store processing details
-            file_info = {
-                'original_file': str(file_path),
-                'patch_file': patch_file,
-                'patch_tool': self.patch_tool,
-                'timestamp': time.time()
-            }
-
-            # Update and save processed files record
-            self.processed_files[file_key] = file_info
-            self.save_processed_files()
-            logger.info(f"Successfully processed: {file_path}")
-
+            logger.info(f"Successfully processed and replaced: {file_path}")
         except subprocess.CalledProcessError as e:
-            logger.error(f"FFmpeg failed for {file_path} with exit code {e.returncode}. See console output for details.")
-            # Clean up temporary file on failure
+            logger.error(f"FFmpeg failed for {file_path} with exit code {e.returncode}. See console for details")
             if patched_file.exists():
                 os.unlink(patched_file)
         except Exception as e:
-            logger.error(f"Failed to process {file_path}: {e}")
-            # Clean up both temporary and patch files on failure
+            logger.error(f"Processing failed for {file_path}: {e}")
+            # Cleanup temporary files on failure
             if patched_file.exists():
                 os.unlink(patched_file)
-            if patch_file and os.path.exists(patch_file):
+            if 'patch_file' in locals() and os.path.exists(patch_file):
                 os.unlink(patch_file)
 
     def copy_file_attributes(self, dst_path, original_stat):
-        """Copy ownership and read/write permissions from original_stat to dst_path.
+        """Copy ownership and permissions from the original file to the destination file.
 
         Args:
-            dst_path (str or Path): Destination file path to apply attributes to.
-            original_stat (os.stat_result): Stat object containing original file attributes.
+            dst_path (str or Path): Path to the file to modify.
+            original_stat (os.stat_result): Stat object of the original file.
 
         Raises:
-            PermissionError: If the operation lacks sufficient permissions.
-            Exception: For other unexpected errors during attribute copying.
+            PermissionError: If permission is denied during attribute setting.
+            Exception: For other failures in attribute copying.
         """
         try:
-            # Set UID and GID from original file
+            # Set ownership (UID and GID)
             os.chown(dst_path, original_stat.st_uid, original_stat.st_gid)
-            # Filter to only read/write permissions
-            perms = original_stat.st_mode & (stat.S_IRUSR | stat.S_IWUSR | 
-                                          stat.S_IRGRP | stat.S_IWGRP | 
-                                          stat.S_IROTH | stat.S_IWOTH)
+            # Copy read/write permissions only
+            perms = original_stat.st_mode & (stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | stat.S_IWOTH)
             os.chmod(dst_path, perms)
-            logger.debug(f"Copied attributes to {dst_path}: UID={original_stat.st_uid}, GID={original_stat.st_gid}, Mode={oct(perms)}")
+            logger.debug(f"Set attributes on {dst_path}: UID={original_stat.st_uid}, GID={original_stat.st_gid}, Mode={oct(perms)}")
         except PermissionError as e:
-            logger.error(f"Permission denied when setting attributes on {dst_path}: {e}")
+            logger.error(f"Permission denied setting attributes on {dst_path}: {e}")
             raise
         except Exception as e:
-            logger.error(f"Failed to copy attributes to {dst_path}: {e}")
+            logger.error(f"Failed to set attributes on {dst_path}: {e}")
             raise
 
     def run(self):
-        """Execute the movie fixing process on all applicable files in the directory."""
-        # Verify the directory exists before proceeding
+        """Process all applicable movie files in the specified directory."""
         if not self.directory.exists():
-            logger.error(f"Directory {self.directory} does not exist")
+            logger.error(f"Directory does not exist: {self.directory}")
             return
-
-        # Process files recursively or in top-level directory only
-        if self.recursive:
-            for file_path in self.directory.rglob('*'):
-                self.process_file(file_path)
-        else:
-            for file_path in self.directory.glob('*'):
-                self.process_file(file_path)
+        # Choose iteration method based on recursive flag
+        iterator = self.directory.rglob('*') if self.recursive else self.directory.glob('*')
+        for file_path in iterator:
+            self.process_file(file_path)
 
 def main():
-    """Parse command-line arguments and run the MovieFixer."""
-    # Set up argument parser with description and options
-    parser = argparse.ArgumentParser(description='Fix movie files for fastseek')
-    parser.add_argument('directory', help='Directory to search for movie files')
-    parser.add_argument('-r', '--recursive', action='store_true',
-                        help='Search recursively through subdirectories')
-    parser.add_argument('-d', '--data-file', default='movie_fixer_data.json',
-                        help='Persistent data file location')
-    parser.add_argument('-g', '--gid', type=int, default=None,
-                        help='Only process files with this group ID')
-
-    # Parse command-line arguments
+    """Parse command-line arguments and initiate the MovieFixer."""
+    parser = argparse.ArgumentParser(description='Fix movie files for fast seeking and generate diff patches')
+    parser.add_argument('directory', help='Directory containing movie files')
+    parser.add_argument('-r', '--recursive', action='store_true', help='Process subdirectories recursively')
+    parser.add_argument('-f', '--force', action='store_true', help='Force processing even if patch files exist')
+    parser.add_argument('-g', '--gid', type=int, default=None, help='Process only files with this group ID')
     args = parser.parse_args()
-
-    # Create and run the MovieFixer instance
-    fixer = MovieFixer(args.directory, args.recursive, args.data_file, args.gid)
+    fixer = MovieFixer(args.directory, args.recursive, args.force, args.gid)
     fixer.run()
 
 if __name__ == '__main__':
