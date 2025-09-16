@@ -142,6 +142,7 @@ class MovieFixer:
         # FFmpeg command to fix the movie file
         cmd = [
             'ffmpeg', '-i', str(file_path),
+            #'-map', '0',
             '-c', 'copy', '-map_metadata', '0',
             '-movflags', '+faststart',
             '-fflags', '+genpts+igndts',
