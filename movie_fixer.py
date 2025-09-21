@@ -14,15 +14,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class MovieFixer:
-    """A utility class to process movie files, generate binary diff patches, and preserve file attributes.
+    """A utility class to process movie files and generate reverse binary diff patches using xdelta3.
 
-    This script uses FFmpeg to fix movie files for fast seeking and generates a patch file using `diff`
-    to record differences between the original and patched files. The patch file can be used to:
-    - Transform the original file to the patched file: `patch <original_file> <patch_file>`
-    - Revert the patched file back to the original: `patch -R <file_path> <patch_file>` (after processing,
-      <file_path> contains the patched file).
+    This script uses FFmpeg to fix movie files for fast seeking and generates a reverse patch file
+    using `xdelta3` to allow reverting from the patched file back to the original. The reverse patch
+    file transforms the patched file to the original file when applied with 
+    `xdelta3 -d -s <patched_file> <patch_file> <original_file>`.
 
-    Patch files are named `<file_path>.<timestamp>.v2.diff` and stored in the same directory as the movie file.
+    Patch files are named `<file_path>.<timestamp>.xdelta3` and stored in the same directory as the movie file.
     """
 
     def __init__(self, directory, recursive, force, target_gid):
@@ -35,7 +34,7 @@ class MovieFixer:
             target_gid (int or None): Group ID to filter files; None means no filtering.
 
         Raises:
-            Exception: If the `diff` tool is not available on the system.
+            Exception: If `xdelta3` tool is not available on the system.
         """
         self.directory = Path(directory).resolve()
         self.recursive = recursive
@@ -43,14 +42,14 @@ class MovieFixer:
         self.target_gid = target_gid
         # Supported movie file extensions
         self.movie_extensions = {'.mp4', '.mkv', '.avi', '.mov'}
-        # Verify that diff is available
-        if not shutil.which('diff'):
-            raise Exception("The 'diff' tool is required but not found in PATH")
+        # Verify that xdelta3 is available
+        if not shutil.which('xdelta3'):
+            raise Exception("The 'xdelta3' tool is required but not found in PATH")
 
     def has_patch_files(self, file_path):
         """Check if patch files exist for the given movie file.
 
-        Looks for files starting with the movie filename and ending with '.v2.diff' in the same directory.
+        Looks for files starting with the movie filename and ending with '.xdelta3' in the same directory.
 
         Args:
             file_path (Path): Path to the movie file.
@@ -58,21 +57,21 @@ class MovieFixer:
         Returns:
             bool: True if any patch files exist, False otherwise.
         """
-        file_base = file_path.name  # e.g., "movie.mp4"
-        dir_path = file_path.parent  # e.g., "/path/to"
+        file_base = file_path.name
+        dir_path = file_path.parent
         for filename in os.listdir(dir_path):
-            if filename.startswith(file_base) and filename.endswith('.v2.diff'):
+            if filename.startswith(file_base) and filename.endswith('.xdelta3'):
                 logger.debug(f"Found patch file: {filename} for {file_path}")
                 return True
         logger.debug(f"No patch files found for {file_path}")
         return False
 
-    def generate_patch(self, original_file, patched_file):
-        """Generate a binary diff patch from the original to the patched file.
+    def generate_reverse_patch(self, original_file, patched_file):
+        """Generate a reverse binary diff patch from the patched file to the original file.
 
-        Creates a patch file named `<original_file>.<timestamp>.v2.diff`. This patch transforms
-        the original file into the patched file when applied with `patch`. To revert from the
-        patched file (post-processing) to the original, use `patch -R`.
+        Creates a patch file named `<original_file>.<timestamp>.xdelta3`. This patch transforms
+        the patched file back to the original file when applied with 
+        `xdelta3 -d -s <patched_file> <patch_file> <original_file>`.
 
         Args:
             original_file (Path): Path to the original movie file.
@@ -82,38 +81,39 @@ class MovieFixer:
             str or None: Path to the generated patch file, or None if generation fails or files are identical.
         """
         timestamp = int(time.time())
-        patch_file = f"{original_file}.{timestamp}.v2.diff"
-        # Command to generate a binary diff patch
-        cmd = ['diff', '--binary', str(original_file), str(patched_file)]
+        patch_file = f"{original_file}.{timestamp}.xdelta3"
+        # Command to generate a reverse binary diff patch (patched -> original)
+        cmd = ['xdelta3', '-e', '-s', str(patched_file), str(original_file), str(patch_file)]
         try:
-            # Redirect diff output to the patch file
-            with open(patch_file, 'w') as f:
-                result = subprocess.run(cmd, stdout=f, text=True)
-            # diff returns: 0 (identical), 1 (different), >1 (error)
-            if result.returncode > 1:
-                raise subprocess.CalledProcessError(result.returncode, cmd)
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            # Check if patch file was created and is non-empty
+            if not os.path.exists(patch_file) or os.path.getsize(patch_file) == 0:
+                logger.warning(f"No differences found between {original_file} and {patched_file}")
+                if os.path.exists(patch_file):
+                    os.unlink(patch_file)
+                return None
             # Preserve original file attributes on the patch file
             original_stat = os.stat(original_file)
             self.copy_file_attributes(patch_file, original_stat)
-            logger.info(f"Generated patch file: {patch_file}")
+            logger.info(f"Generated reverse patch file: {patch_file}")
             return patch_file
         except subprocess.CalledProcessError as e:
-            logger.error(f"diff failed for {original_file} with exit code {e.returncode}")
+            logger.error(f"xdelta3 failed for {original_file} with exit code {e.returncode}: {e.stderr}")
             if os.path.exists(patch_file):
                 os.unlink(patch_file)
             return None
         except Exception as e:
-            logger.error(f"Patch generation failed for {original_file}: {e}")
+            logger.error(f"Reverse patch generation failed for {original_file}: {e}")
             if os.path.exists(patch_file):
                 os.unlink(patch_file)
             return None
 
     def process_file(self, file_path):
-        """Process a movie file with FFmpeg and generate a patch for changes.
+        """Process a movie file with FFmpeg and generate a reverse patch for reverting changes.
 
         Skips processing if patch files exist and force mode is off, or if the file doesn’t match
         the target group ID (if specified). Replaces the original file with the patched version
-        and generates a patch file.
+        and generates a reverse patch file.
 
         Args:
             file_path (str or Path): Path to the movie file to process.
@@ -142,7 +142,7 @@ class MovieFixer:
         # FFmpeg command to fix the movie file
         cmd = [
             'ffmpeg', '-i', str(file_path),
-            #'-map', '0',
+            '-map', '0',
             '-c', 'copy', '-map_metadata', '0',
             '-movflags', '+faststart',
             '-fflags', '+genpts+igndts',
@@ -152,7 +152,7 @@ class MovieFixer:
             '-nostdin',
             str(patched_file)
         ]
-        patch_file = None  # Initialize to avoid undefined variable in cleanup
+        patch_file = None
         try:
             # Execute FFmpeg and stream output
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -167,10 +167,10 @@ class MovieFixer:
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, cmd, output="Check console output")
 
-            # Generate patch before replacing the original file
-            patch_file = self.generate_patch(file_path, patched_file)
+            # Generate reverse patch before replacing the original file
+            patch_file = self.generate_reverse_patch(original_file=file_path, patched_file=patched_file)
             if patch_file is None:
-                raise Exception("Patch generation failed or files are identical")
+                raise Exception("Reverse patch generation failed or files are identical")
 
             # Replace original file with patched version
             os.unlink(file_path)
@@ -227,7 +227,7 @@ class MovieFixer:
 
 def main():
     """Parse command-line arguments and initiate the MovieFixer."""
-    parser = argparse.ArgumentParser(description='Fix movie files for fast seeking and generate diff patches')
+    parser = argparse.ArgumentParser(description='Fix movie files for fast seeking and generate reverse xdelta3 patches')
     parser.add_argument('directory', help='Directory containing movie files')
     parser.add_argument('-r', '--recursive', action='store_true', help='Process subdirectories recursively')
     parser.add_argument('-f', '--force', action='store_true', help='Force processing even if patch files exist')
