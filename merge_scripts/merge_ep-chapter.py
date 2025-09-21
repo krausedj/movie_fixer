@@ -7,7 +7,7 @@ from pathlib import Path
 from collections import defaultdict
 
 def get_episode_groups(input_folder):
-    # Updated pattern to handle full-width hash and flexible whitespace
+    # Pattern to handle full-width hash and flexible whitespace
     pattern = r'[＃#](\d+)-(\d+)\s*.*?\[(\d{4}-\d{2}-\d{2})\]\[.*?\]\.mp4'
     
     episode_groups = defaultdict(list)
@@ -52,20 +52,28 @@ def concatenate_videos(input_folder, custom_tag):
         return
     
     for (episode_num, date), files in episode_groups.items():
-        print(f"Processing episode {episode_num} (date: {date}) with files: {files}")
-        files.sort(key=lambda x: int(re.search(r'-(\d+)', x).group(1)))
+        print(f"Processing episode {episode_num} (date: {date}) with files (before sorting): {files}")
+        # Sort files by part number
+        try:
+            # Use a more specific regex to extract part number
+            files.sort(key=lambda x: int(re.match(r'[＃#]\d+-(\d+)', x, re.UNICODE).group(1)))
+            print(f"Sorted files for episode {episode_num}: {files}")
+        except (AttributeError, ValueError) as e:
+            print(f"Error sorting files for episode {episode_num}: {e}")
+            print(f"Skipping episode {episode_num} due to sorting failure.")
+            continue
         
-        output_file = output_folder / f"{episode_num}_{custom_tag}_merged_{date}.mkv"
+        output_file = output_folder / f"{custom_tag}_E{episode_num}_merged_{date}.mkv"
         concat_file = create_ffmpeg_concat_file([input_path / f for f in files], output_folder)
         
         ffmpeg_cmd = [
             'ffmpeg',
+            '-y',  # Auto-overwrite
             '-f', 'concat',
             '-safe', '0',
             '-i', str(concat_file),
             '-map', '0',
             '-c', 'copy',
-            '-y',
             str(output_file)
         ]
         
