@@ -77,12 +77,12 @@ def concatenate_videos(input_folder, custom_tag):
             print(f"Skipping episode {episode_num} due to sorting failure.")
             continue
         
-        # Translate all titles for this episode and join them
-        translated_titles = [translate_title(file[2]) for file in files]
+        # Translate all titles and prepend part number
+        translated_titles = [f"{file[1]}_{translate_title(file[2])}" for file in files]
         title_string = '_'.join(translated_titles)
         print(f"Translated titles for episode {episode_num}: {translated_titles}")
         
-        # Create output filename with all translated titles
+        # Create output filename with part numbers and translated titles
         output_file = output_folder / f"{custom_tag}_E{episode_num}_merged_{title_string}_{date}.mkv"
         concat_file = create_ffmpeg_concat_file(files, input_path, output_folder)
         
@@ -112,7 +112,7 @@ def concatenate_videos(input_folder, custom_tag):
             print(f"Cleaned up concat file: {concat_file}")
 
 def main():
-    parser = argparse.ArgumentParser(description='Concatenate video files with similar episode numbers and include translated chapter titles')
+    parser = argparse.ArgumentParser(description='Concatenate video files with similar episode numbers and include translated chapter titles with part numbers')
     parser.add_argument('input_folder', help='Input folder containing video files')
     parser.add_argument('custom_tag', help='Custom tag for output filename')
     
